@@ -1,0 +1,1 @@
+First we initilize vault (i'm going to use dev mode)
