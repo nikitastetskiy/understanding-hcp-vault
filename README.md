@@ -2,6 +2,7 @@
 
 1. [Docker setup](./00-docker/)
 2. [Namespaces and auth](./01-namespaces-and-auth/)
+3. [Centralized SAML identity with namespace-local authorization](./104-centralized-saml-namespace-authorization/)
 
 ---
 
