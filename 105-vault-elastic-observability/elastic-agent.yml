@@ -1,0 +1,31 @@
+outputs:
+  default:
+    type: elasticsearch
+    hosts: ["http://elasticsearch:9200"]
+    username: elastic
+    password: ${ELASTIC_PASSWORD}
+
+inputs:
+  - type: tcp
+    id: vault-audit-socket
+    data_stream.namespace: default
+    streams:
+      - id: vault-audit-socket-stream
+        data_stream:
+          dataset: hashicorp_vault.audit
+          type: logs
+        host: "0.0.0.0:9007"
+        max_message_size: 1MiB
+        tags: [hashicorp-vault-audit, forwarded]
+
+  - type: filestream
+    id: vault-operational-log
+    data_stream.namespace: default
+    streams:
+      - id: vault-operational-log-stream
+        data_stream:
+          dataset: hashicorp_vault.log
+          type: logs
+        paths:
+          - /var/log/vault/vault-operational.json
+        tags: [hashicorp-vault-log]
