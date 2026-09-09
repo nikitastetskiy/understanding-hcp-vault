@@ -78,6 +78,20 @@ vault policy write reader "$LAB_DIR/policies/reader.hcl" >/dev/null
 vault auth enable userpass >/dev/null
 vault write auth/userpass/users/analyst password=correct-password policies=reader >/dev/null
 
+# Model the SITA investigation rule with an AppRole whose name starts with ibm
+# and ends with p. Its authenticated read gives Elastic role, entity/client ID,
+# path, source, and user-agent evidence to classify and aggregate.
+vault auth enable approle >/dev/null
+vault write auth/approle/role/ibmmq-lab-p token_policies=reader >/dev/null
+APPROLE_ROLE_ID=$(vault read -field=role_id auth/approle/role/ibmmq-lab-p/role-id)
+APPROLE_SECRET_ID=$(vault write -f -field=secret_id auth/approle/role/ibmmq-lab-p/secret-id)
+APPROLE_TOKEN=$(vault write -field=token auth/approle/login \
+  role_id="$APPROLE_ROLE_ID" secret_id="$APPROLE_SECRET_ID")
+APPROLE_ENTITY_ID=$(VAULT_TOKEN=$APPROLE_TOKEN vault token lookup -format=json \
+  | jq -r '.data.entity_id')
+test -n "$APPROLE_ENTITY_ID"
+VAULT_TOKEN=$APPROLE_TOKEN vault kv get -field=value secret/application/config >/dev/null
+
 ANALYST_TOKEN=$(vault login -field=token -method=userpass \
   username=analyst password=correct-password)
 ANALYST_ENTITY_ID=$(VAULT_TOKEN=$ANALYST_TOKEN vault token lookup -format=json \
@@ -126,6 +140,18 @@ if entity_count=$(wait_for_audit_count "$entity_query" 1); then
     "$entity_count" "$ANALYST_ENTITY_ID"
 else
   printf 'FAIL: analyst activity was not attributable by entity_id/client_id\n' >&2
+  exit 1
+fi
+
+# Prove that Elastic can find an expected-unused naming pattern and correlate
+# the readable AppRole name with a stable entity/client ID.
+approle_query=$(jq -cn --arg entity_id "$APPROLE_ENTITY_ID" \
+  '{bool:{filter:[{term:{"hashicorp_vault.audit.auth.metadata.role_name":"ibmmq-lab-p"}},{term:{"hashicorp_vault.audit.auth.entity_id":$entity_id}},{term:{"hashicorp_vault.audit.request.client_id":$entity_id}}]}}')
+if approle_count=$(wait_for_audit_count "$approle_query" 1); then
+  printf 'PASS Elastic: classified %s expected-unused-pattern AppRole event(s) for client %s\n' \
+    "$approle_count" "$APPROLE_ENTITY_ID"
+else
+  printf 'FAIL: AppRole activity was not classifiable by role/entity/client ID\n' >&2
   exit 1
 fi
 

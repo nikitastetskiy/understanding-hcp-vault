@@ -119,8 +119,9 @@ It then:
 6. Verifies the file audit log exists and contains data.
 7. Queries Elasticsearch for parsed failed-login and permission-denied events.
 8. Correlates the analyst's audit activity by Vault entity and client ID.
-9. Verifies that Vault operational events were indexed separately.
-10. Stops Elastic Agent and proves Vault still serves a request through the file audit device.
+9. Creates an `ibm...p` AppRole and verifies Elastic can correlate its role, entity, and client ID.
+10. Verifies that Vault operational events were indexed separately.
+11. Stops Elastic Agent and proves Vault still serves a request through the file audit device.
 
 The Elastic package transforms raw Vault fields into both
 `hashicorp_vault.audit.*` and standard Elastic Common Schema fields. Examples include:
@@ -162,6 +163,7 @@ PASS file: Vault appended JSON audit records to the local file device
 PASS Elastic: indexed 1 failed userpass audit event(s)
 PASS Elastic: indexed 2 permission-denied audit event(s)
 PASS Elastic: attributed audit event(s) to entity/client <UUID>
+PASS Elastic: classified 1 expected-unused-pattern AppRole event(s) for client <UUID>
 PASS Elastic: indexed Vault operational log event(s)
 PASS resilience: Vault served a request through the file device while TCP was down
 Lab completed successfully. Kibana: http://127.0.0.1:15601
@@ -288,6 +290,120 @@ complement one another:
 Vault activity/client data -> which clients were counted in the period
 Vault audit data in Elastic -> what those clients attempted and what Vault returned
 ```
+
+### SITA client investigation in Elastic
+
+For the SITA and HashiCorp review, use Vault's client activity export as the authoritative population
+of counted clients and Elastic as the investigation layer. Elastic can classify the audit evidence,
+show activity for roles that were expected to be unused, and expose one role being associated with
+several entity/client IDs. It cannot independently reproduce Vault's billing algorithm.
+
+The start of audit coverage is a hard boundary. In the described case, auditing began on 11 May, so
+the absence of an Elastic event cannot establish that a client was inactive from 1-10 May. Record
+the cluster, namespace, query window, export generation time, Vault version, audit filters, and known
+ingestion outages with every result.
+
+#### Add investigation classifications
+
+In Kibana, create the following **runtime fields** on the `logs-*` data view. Runtime fields keep the
+lab non-destructive: they classify the indexed events without changing the official integration's
+ingest pipeline or reindexing data.
+
+`vault.client_type` as `keyword`:
+
+```painless
+if (doc.containsKey('hashicorp_vault.audit.auth.entity_id') &&
+    doc['hashicorp_vault.audit.auth.entity_id'].size() != 0) {
+  emit('entity');
+} else if (doc.containsKey('hashicorp_vault.audit.request.client_id') &&
+           doc['hashicorp_vault.audit.request.client_id'].size() != 0) {
+  emit('non-entity');
+}
+```
+
+`vault.expected_unused_role_observed` as `boolean`:
+
+```painless
+if (doc.containsKey('hashicorp_vault.audit.auth.metadata.role_name') &&
+    doc['hashicorp_vault.audit.auth.metadata.role_name'].size() != 0) {
+  def role = doc['hashicorp_vault.audit.auth.metadata.role_name'].value;
+  emit(role.startsWith('ibm') && role.endsWith('p'));
+}
+```
+
+The second field does not declare the client invalid or non-billable. A `true` value means only that
+the available audit evidence contradicts the expectation that an `ibm...p` role was unused.
+
+The official integration maps `hashicorp_vault.audit.auth.metadata` as `flattened`. Flattened leaf
+keys such as `.role_name` can be queried and aggregated as keyword-like values, but are not analyzed
+as full text. Inspect one AppRole document in Discover before creating the runtime field because the
+available metadata still depends on the auth method and Vault record. If a deployment uses a custom
+mapping, add a narrowly scoped custom ingest pipeline rather than modifying the package-managed
+pipeline.
+
+#### Find the roles expected to be unused
+
+Set the Kibana time picker to the evidence window, for example 11-31 May, and run:
+
+```text
+data_stream.dataset: "hashicorp_vault.audit" and
+vault.expected_unused_role_observed: true
+```
+
+In a Lens table, use role name as the row and add these metrics:
+
+- Unique count of `hashicorp_vault.audit.request.client_id`.
+- Unique count of `hashicorp_vault.audit.auth.entity_id`.
+- Unique count of `event.id` as an approximate operation count.
+- Minimum and maximum `@timestamp`.
+- Top values of `source.ip`, `event.action`, and `hashicorp_vault.audit.request.path`.
+
+Vault normally emits request and response audit records with the same `request.id`, mapped to
+`event.id`. A unique count of `event.id` avoids counting that pair twice. It is an activity metric,
+not a billing quantity. If copies from multiple audit devices are indexed, use the same event ID
+plus cluster identity when deduplicating or aggregating across independent clusters.
+
+#### Detect possible entity recreation
+
+Create another Lens table with role name as the row, **unique count** of
+`hashicorp_vault.audit.auth.entity_id` as the metric, and filter for values greater than one. A role
+such as `ibmmq-sf2mqiqclr-clr-q` associated with several entity IDs is evidence of identity churn
+and is consistent with the reported Terraform recreation scenario.
+
+It is not proof that Terraform caused the recreation. Confirm the cause against Terraform state and
+apply logs, Vault entity/alias lifecycle records, and the client activity export. A stable AppRole or
+display name is descriptive metadata; it is not necessarily the stable identity used for client
+counting.
+
+If the Terraform caller's user agent is available in the indexed audit document, add it to the table
+and filter it as supporting evidence. Do not classify an entity as Terraform-created solely from a
+`Go-http-client/1.1` user agent because many Go applications use that value.
+
+#### Reconcile with the Vault export
+
+Compare the 3 July client activity export with Elastic by stable `client_id`, keeping three result
+sets:
+
+| Result set | Interpretation |
+|---|---|
+| Export client with Elastic evidence | Investigate the role, paths, first/last event, IP, and outcomes |
+| Export client without Elastic evidence | Unknown when audit coverage is partial; do not label unused |
+| Elastic client absent from the export | Check cluster, namespace, export period, ingestion duplication, and ID source |
+
+For a small review, use the exported IDs in a KQL filter:
+
+```text
+data_stream.dataset: "hashicorp_vault.audit" and
+hashicorp_vault.audit.request.client_id: (
+  "<CLIENT_ID_1>" or "<CLIENT_ID_2>" or "<CLIENT_ID_3>"
+)
+```
+
+For a repeatable large-scale reconciliation, ingest a sanitized copy of the Vault export into a
+separate, access-controlled Elasticsearch index and correlate by `client_id` with an ES|QL `LOOKUP
+JOIN` or an Elasticsearch enrich policy. Do not put client exports into the audit data stream or
+modify the package-managed mappings. This preserves provenance: the export says which clients Vault
+counted, while the audit data explains what those IDs did.
 
 The integration also installs its **[Hashicorp Vault] Audit Logs** and operational-log dashboards.
 The official tutorial uses these same integration assets but configures Fleet interactively. This
