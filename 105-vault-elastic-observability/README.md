@@ -298,8 +298,11 @@ For example, find activity from roles that were expected to be unused:
 
 ```text
 data_stream.dataset: "hashicorp_vault.audit" and
-hashicorp_vault.audit.auth.metadata.role_name: <prefix>*<suffix>
+hashicorp_vault.audit.auth.metadata.role_name: application-*-prod
 ```
+
+Replace `application-` and `-prod` with the required role prefix and suffix. KQL wildcards are not
+regular expressions, and angle-bracket placeholders are invalid unless quoted as literal text.
 
 Build a Lens table grouped by `hashicorp_vault.audit.auth.metadata.role_name` with:
 
