@@ -4,6 +4,7 @@
 2. [Namespaces and auth](./01-namespaces-and-auth/)
 3. [Centralized SAML identity with namespace-local authorization](./104-centralized-saml-namespace-authorization/)
 4. [Vault audit logging and observability with Elastic](./105-vault-elastic-observability/)
+5. [From client count to usage-based billing metrics in Vault 2.x](./106-vault-consumption-billing-metrics/)
 
 ---
 
